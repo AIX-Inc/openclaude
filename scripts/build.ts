@@ -40,6 +40,7 @@ const featureFlags: Record<string, boolean> = {
   BUDDY: false,
   CHICAGO_MCP: false,
   COWORKER_TYPE_TELEMETRY: false,
+  DIRECT_CONNECT: true,
 }
 
 const result = await Bun.build({
@@ -110,7 +111,14 @@ export async function handleBgFlag() { throw new Error("Background sessions are 
         build.onLoad(
           { filter: /.*/, namespace: 'bun-bundle-shim' },
           () => ({
-            contents: `export function feature(name) { return false; }`,
+            contents: [
+              `const FEATURES = ${JSON.stringify(featureFlags)};`,
+              // Export feature as a lookup that Bun cannot constant-fold away.
+              // Using an indirect call prevents the bundler from inlining "false"
+              // for every call site and tree-shaking the guarded blocks.
+              `const _lookup = (n) => !!FEATURES[n];`,
+              `export const feature = _lookup;`,
+            ].join('\n'),
             loader: 'js',
           }),
         )
