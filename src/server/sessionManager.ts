@@ -53,6 +53,8 @@ export class SessionManager {
   create(opts: {
     cwd: string
     env?: Record<string, string>
+    allowedTools?: string[]
+    disallowedTools?: string[]
     onMessage: (sessionId: string, line: string) => void
   }): SessionInfo {
     if (
@@ -69,6 +71,8 @@ export class SessionManager {
       sessionId,
       cwd: opts.cwd,
       env: opts.env,
+      allowedTools: opts.allowedTools,
+      disallowedTools: opts.disallowedTools,
       onMessage: (line) => {
         // Reset idle timer on activity
         this.resetIdleTimer(sessionId)

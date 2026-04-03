@@ -169,7 +169,12 @@ async function handleCreateSession(
   wsConnections: Map<string, Set<WebSocket>>,
   serverPort: number,
 ) {
-  let body: { cwd?: string; env?: Record<string, string> }
+  let body: {
+    cwd?: string
+    env?: Record<string, string>
+    allowedTools?: string[]
+    disallowedTools?: string[]
+  }
   try {
     const raw = await readBody(req)
     body = JSON.parse(raw)
@@ -184,6 +189,8 @@ async function handleCreateSession(
     const session = sessionManager.create({
       cwd,
       env: body.env,
+      allowedTools: body.allowedTools,
+      disallowedTools: body.disallowedTools,
       onMessage: (sessionId, line) => {
         // Route subprocess NDJSON output to all connected WebSocket clients
         const connections = wsConnections.get(sessionId)

@@ -61,6 +61,8 @@ export class DangerousBackend {
     sessionId: string
     cwd: string
     env?: Record<string, string>
+    allowedTools?: string[]
+    disallowedTools?: string[]
     onMessage: OnMessage
     onClose: OnClose
     logger?: ServerLogger
@@ -75,6 +77,13 @@ export class DangerousBackend {
       '--verbose',
       '--dangerously-skip-permissions',
     ]
+
+    if (opts.allowedTools && opts.allowedTools.length > 0) {
+      args.push('--allowedTools', ...opts.allowedTools)
+    }
+    if (opts.disallowedTools && opts.disallowedTools.length > 0) {
+      args.push('--disallowedTools', ...opts.disallowedTools)
+    }
 
     const env: NodeJS.ProcessEnv = {
       ...process.env,
