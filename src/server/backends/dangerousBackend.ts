@@ -74,6 +74,16 @@ export class DangerousBackend {
       'stream-json',
       '--verbose',
       '--dangerously-skip-permissions',
+      // BizWiki 専用: MCP の DB 操作ツールのみ許可し、
+      // Bash, Read, Write 等のデフォルトツールを無効化
+      '--allowedTools',
+      'mcp__bizwiki__db_list_files',
+      'mcp__bizwiki__db_read_file',
+      'mcp__bizwiki__db_write_file',
+      'mcp__bizwiki__db_create_directory',
+      'mcp__bizwiki__db_search_files',
+      'mcp__bizwiki__db_move_file',
+      'mcp__bizwiki__db_remove_file',
     ]
 
     const env: NodeJS.ProcessEnv = {
