@@ -106,6 +106,10 @@ function convertSystemPrompt(
   return String(system)
 }
 
+// Maximum character length for a single tool result to prevent request bloat
+// when the model loops on read-heavy tools (e.g. MCP db_read_file).
+const MAX_TOOL_RESULT_LENGTH = 50_000
+
 function convertContentBlocks(
   content: unknown,
 ): string | Array<{ type: string; text?: string; image_url?: { url: string } }> {
@@ -182,11 +186,17 @@ function convertMessages(
 
         // Emit tool results as tool messages
         for (const tr of toolResults) {
-          const trContent = Array.isArray(tr.content)
+          let trContent = Array.isArray(tr.content)
             ? tr.content.map((c: { text?: string }) => c.text ?? '').join('\n')
             : typeof tr.content === 'string'
               ? tr.content
               : JSON.stringify(tr.content ?? '')
+          // Truncate oversized tool results to prevent request body bloat
+          // which causes "invalid JSON" errors on the OpenAI API when the
+          // model loops on read-heavy tools (e.g. MCP db_read_file).
+          if (trContent.length > MAX_TOOL_RESULT_LENGTH) {
+            trContent = trContent.slice(0, MAX_TOOL_RESULT_LENGTH) + '\n...[truncated]'
+          }
           result.push({
             role: 'tool',
             tool_call_id: tr.tool_use_id ?? 'unknown',
@@ -230,18 +240,31 @@ function convertMessages(
               name?: string
               input?: unknown
               extra_content?: Record<string, unknown>
-            }) => ({
-              id: tu.id ?? `call_${Math.random().toString(36).slice(2)}`,
-              type: 'function' as const,
-              function: {
-                name: tu.name ?? 'unknown',
-                arguments:
-                  typeof tu.input === 'string'
-                    ? tu.input
-                    : JSON.stringify(tu.input ?? {}),
-              },
-              ...(tu.extra_content ? { extra_content: tu.extra_content } : {}),
-            }),
+            }) => {
+              // Ensure arguments is always a valid JSON string.
+              // When tu.input is already a string, validate it parses as JSON;
+              // if not, wrap it so the OpenAI API never receives malformed arguments.
+              let args: string
+              if (typeof tu.input === 'string') {
+                try {
+                  JSON.parse(tu.input)
+                  args = tu.input
+                } catch {
+                  args = JSON.stringify({ raw: tu.input })
+                }
+              } else {
+                args = JSON.stringify(tu.input ?? {})
+              }
+              return {
+                id: tu.id ?? `call_${Math.random().toString(36).slice(2)}`,
+                type: 'function' as const,
+                function: {
+                  name: tu.name ?? 'unknown',
+                  arguments: args,
+                },
+                ...(tu.extra_content ? { extra_content: tu.extra_content } : {}),
+              }
+            },
           )
         }
 
@@ -412,6 +435,7 @@ function convertChunkUsage(
 async function* openaiStreamToAnthropic(
   response: Response,
   model: string,
+  requestBodyLength?: number,
 ): AsyncGenerator<AnthropicStreamEvent> {
   const messageId = makeMessageId()
   let contentBlockIndex = 0
@@ -420,6 +444,7 @@ async function* openaiStreamToAnthropic(
   let lastStopReason: 'tool_use' | 'max_tokens' | 'end_turn' | null = null
   let hasEmittedFinalUsage = false
   let hasProcessedFinishReason = false
+  let outputCharCount = 0
 
   // Emit message_start
   yield {
@@ -489,6 +514,7 @@ async function* openaiStreamToAnthropic(
             index: contentBlockIndex,
             delta: { type: 'text_delta', text: delta.content },
           }
+          outputCharCount += delta.content.length
         }
 
         // Tool calls
@@ -536,6 +562,7 @@ async function* openaiStreamToAnthropic(
                     partial_json: tc.function.arguments,
                   },
                 }
+                outputCharCount += tc.function.arguments.length
               }
             } else if (tc.function?.arguments) {
               // Continuation of existing tool call
@@ -552,6 +579,7 @@ async function* openaiStreamToAnthropic(
                     partial_json: tc.function.arguments,
                   },
                 }
+                outputCharCount += tc.function.arguments.length
               }
             }
           }
@@ -642,6 +670,25 @@ async function* openaiStreamToAnthropic(
     reader.releaseLock()
   }
 
+  // If the provider didn't return any usage data (e.g., doesn't support
+  // stream_options.include_usage), emit an estimated usage so that
+  // auto-compact's token counting doesn't see all-zeros and fail to trigger.
+  // Rough estimate: ~4 chars per token for output, request body chars / 4 for input.
+  if (!hasEmittedFinalUsage && (requestBodyLength ?? 0) > 0) {
+    const estimatedInputTokens = Math.ceil((requestBodyLength ?? 0) / 4)
+    const estimatedOutputTokens = Math.ceil(outputCharCount / 4)
+    yield {
+      type: 'message_delta',
+      delta: { stop_reason: lastStopReason, stop_sequence: null },
+      usage: {
+        input_tokens: estimatedInputTokens,
+        output_tokens: estimatedOutputTokens,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    }
+  }
+
   yield { type: 'message_stop' }
 }
 
@@ -686,10 +733,11 @@ class OpenAIShimMessages {
       httpResponse = response
 
       if (params.stream) {
+        const bodyLength = (response as Response & { _requestBodyLength?: number })._requestBodyLength
         return new OpenAIShimStream(
           request.transport === 'codex_responses'
             ? codexStreamToAnthropic(response, request.resolvedModel)
-            : openaiStreamToAnthropic(response, request.resolvedModel),
+            : openaiStreamToAnthropic(response, request.resolvedModel, bodyLength),
         )
       }
 
@@ -762,7 +810,7 @@ class OpenAIShimMessages {
     request: ReturnType<typeof resolveProviderRequest>,
     params: ShimCreateParams,
     options?: { signal?: AbortSignal; headers?: Record<string, string> },
-  ): Promise<Response> {
+  ): Promise<Response & { _requestBodyLength?: number }> {
     const openaiMessages = convertMessages(
       params.messages as Array<{
         role: string
@@ -879,10 +927,11 @@ class OpenAIShimMessages {
       chatCompletionsUrl = `${request.baseUrl}/chat/completions`
     }
 
+    const bodyStr = JSON.stringify(body)
     const fetchInit = {
       method: 'POST' as const,
       headers,
-      body: JSON.stringify(body),
+      body: bodyStr,
       signal: options?.signal,
     }
 
@@ -891,6 +940,8 @@ class OpenAIShimMessages {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       response = await fetch(chatCompletionsUrl, fetchInit)
       if (response.ok) {
+        // Attach request body length for usage estimation when provider doesn't return token counts
+        ;(response as Response & { _requestBodyLength?: number })._requestBodyLength = bodyStr.length
         return response
       }
       if (
@@ -909,12 +960,13 @@ class OpenAIShimMessages {
       const errorBody = await response.text().catch(() => 'unknown error')
       const rateHint =
         isGithub && response.status === 429 ? formatRetryAfterHint(response) : ''
+      const sizeInfo = `(request body: ${(bodyStr.length / 1024).toFixed(0)}KB, ${openaiMessages.length} messages)`
       let errorResponse: object | undefined
       try { errorResponse = JSON.parse(errorBody) } catch { /* raw text */ }
       throw APIError.generate(
         response.status,
         errorResponse,
-        `OpenAI API error ${response.status}: ${errorBody}${rateHint}`,
+        `OpenAI API error ${response.status} ${sizeInfo}: ${errorBody}${rateHint}`,
         response.headers as unknown as Record<string, string>,
       )
     }
