@@ -229,6 +229,17 @@ export function tokenCountWithEstimation(messages: readonly Message[]): number {
     const message = messages[i]
     const usage = message ? getTokenUsage(message) : undefined
     if (message && usage) {
+      const count = getTokenCountFromUsage(usage)
+      // OpenAI-compatible providers may not return token counts in streaming
+      // responses, leaving usage as all-zeros from the shim's message_start.
+      // Trusting zero usage would make tokenCountWithEstimation return ~0,
+      // preventing auto-compact from ever firing. Skip zero-usage messages
+      // and continue searching for a prior message with real data, or fall
+      // through to full rough estimation.
+      if (count === 0) {
+        i--
+        continue
+      }
       // Walk back past any earlier sibling records split from the same API
       // response (same message.id) so interleaved tool_results between them
       // are included in the estimation slice.
@@ -251,7 +262,7 @@ export function tokenCountWithEstimation(messages: readonly Message[]): number {
         }
       }
       return (
-        getTokenCountFromUsage(usage) +
+        count +
         roughTokenCountEstimationForMessages(messages.slice(i + 1))
       )
     }
